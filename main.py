@@ -128,7 +128,7 @@ class MyApp(ctk.CTk):
             state="disabled",
             font=("TkDefaultFont", FONT_SIZES["ai"]),
         )
-        self.response.grid(row=0, column=1, columnspan=2, sticky="nsew", padx=10, pady=(10, 5))
+        self.response.grid(row=0, column=1, sticky="nsew", padx=10, pady=(10, 5))
         tb = self.response._textbox
         tb.configure(padx=8, pady=6)
         # user bubbles sit on their own right-justified line
@@ -143,14 +143,13 @@ class MyApp(ctk.CTk):
             wrap="word",
             font=("TkDefaultFont", FONT_SIZES["entry"]),
         )
-        self.entry.grid(row=1, column=1, sticky="ew", padx=(10, 5), pady=(5, 10))
+        self.entry.grid(row=1, column=1, sticky="ew", padx=10, pady=(5, 10))
         self.entry.bind("<Return>", self.on_enter)
         self.entry.bind("<Shift-Return>", self.on_shift_enter)
         self.bind("<Escape>", lambda e: self.stop())
 
-        # Send while idle, Stop while a reply is streaming
-        self.send_btn = ctk.CTkButton(self, text="Send", width=70, height=70, command=self.send_or_stop)
-        self.send_btn.grid(row=1, column=2, padx=(0, 10), pady=(5, 10))
+        # only shown while a reply is streaming, over the right edge of the entry
+        self.stop_btn = ctk.CTkButton(self.entry, text="Stop", width=60, command=self.stop)
 
         self.sidebar = ctk.CTkFrame(self, width=250, corner_radius=0, fg_color="transparent")
         self.sidebar.grid(row=0, column=0, rowspan=2, sticky="ns")
@@ -281,8 +280,9 @@ class MyApp(ctk.CTk):
             scrollbar_button_color=t["scrollbar"],
             scrollbar_button_hover_color=t["scrollbar_hover"],
         )
-        for btn in (self.new_btn, self.send_btn):
+        for btn in (self.new_btn, self.stop_btn):
             btn.configure(fg_color=t["button"], hover_color=t["button_hover"], text_color=t["text"])
+        self.stop_btn.configure(bg_color=t["surface"])  # rounded corners sit on the entry
         self.model_menu.configure(
             fg_color=t["button"],
             button_color=t["menu_button"],
@@ -334,18 +334,12 @@ class MyApp(ctk.CTk):
         self.history.append({"role": "user", "content": text})
         self.generating = True
         self.stop_event.clear()
-        self.send_btn.configure(text="Stop")
+        self.stop_btn.place(relx=1, rely=0.5, anchor="e", x=-22)
         self.add_user_bubble(text)
         self.renderer.start()
         self.stats = None
         threading.Thread(target=self.worker, daemon=True).start()
         self.after(50, self.poll)
-
-    def send_or_stop(self):
-        if self.generating:
-            self.stop()
-        else:
-            self.send()
 
     def stop(self):
         if not self.generating:
@@ -442,7 +436,7 @@ class MyApp(ctk.CTk):
                     if secs is not None and self.history and self.history[-1]["role"] == "assistant":
                         self.history[-1]["think_secs"] = secs
                     self.generating = False
-                    self.send_btn.configure(text="Send")
+                    self.stop_btn.place_forget()
                     self.save_chat()
                     return
         except queue.Empty:
