@@ -8,12 +8,14 @@ built with Python and [CustomTkinter](https://github.com/TomSchimansky/CustomTki
 ## Features
 
 - Streams replies token by token from your local Ollama server
+- Stop a reply mid-stream with the Stop button (or Esc); the partial reply is kept
 - Lists every model you have installed in Ollama and lets you switch between them
   (the window title shows the current model)
 - Renders Markdown as it arrives: code blocks, bold/italic, lists, quotes, headings and links
 - Shows the reasoning of thinking models (Ollama's `thinking` field or `<think>` tags)
   separately from the answer, with how long the model thought
-- Shows tokens and tokens/sec for each reply
+- Shows tokens, tokens/sec and how full the context window is for each reply
+- Reopen any saved chat and keep going: the whole conversation is sent back to the model
 - Saves chats automatically and lists them in the sidebar; right-click a chat to delete it
 - Right-click your own messages to copy them
 - Dark and light themes
@@ -67,8 +69,11 @@ These settings are constants at the top of `main.py`:
 | `MODEL`    | `qwen2.5-coder:7b`                      | Model used if no other is chosen   |
 | `URL`      | `http://localhost:11434/api/chat`       | Ollama chat endpoint                |
 | `CHAT_DIR` | `~/.local/share/quen/chats`             | Where chats are saved               |
+| `NUM_CTX`  | `16384`                                 | Context window in tokens, capped at the model's max |
 
 Your last model and theme are remembered in `~/.local/share/quen/settings.json`.
+You can also set `"num_ctx"` there to override `NUM_CTX`. A bigger context window
+lets the model remember more of a long chat, but uses more memory (VRAM/RAM).
 
 ## Files
 

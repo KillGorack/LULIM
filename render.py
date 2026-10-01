@@ -220,7 +220,14 @@ class ReplyRenderer:
         if self.tb.get("end-2c", "end-1c") not in ("", "\n"):
             self.insert("\n")
         if stats and stats.get("tokens"):
-            self.insert(f"{stats['tps']:.1f} tok/s  ·  {stats['tokens']} tokens\n", ("stats",))
+            line = f"{stats['tps']:.1f} tok/s  ·  {stats['tokens']} tokens"
+            if stats.get("ctx_max"):
+                pct = round(100 * stats["ctx"] / stats["ctx_max"])
+                line += f"  ·  context {stats['ctx']:,} / {stats['ctx_max']:,} ({pct}%)"
+            self.insert(line + "\n", ("stats",))
+
+    def mark_stopped(self):
+        self.insert("stopped\n", ("stats",))
 
     def show_error(self, msg):
         self.finish()
