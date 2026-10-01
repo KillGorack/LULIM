@@ -35,7 +35,7 @@ sudo dnf install python3-tkinter
 ## Install
 
 ```bash
-git clone <this repo> LULIM
+git clone https://github.com/KillGorack/LULIM.git
 cd LULIM
 pip install --user customtkinter requests pillow
 ```
