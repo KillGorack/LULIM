@@ -2,7 +2,6 @@
 import base64
 import io
 import json
-import math
 import queue
 import re
 import threading
@@ -13,7 +12,7 @@ from pathlib import Path
 
 import customtkinter as ctk
 import requests
-from PIL import Image, ImageDraw
+from PIL import Image
 
 from render import ReplyRenderer
 
@@ -27,6 +26,7 @@ SHOW_URL = "http://localhost:11434/api/show"
 NUM_CTX = 16384
 CHAT_DIR = Path.home() / ".local/share/quen/chats"
 SETTINGS_FILE = CHAT_DIR.parent / "settings.json"
+ICON_DIR = Path(__file__).with_name("icons")  # Lucide icons (ISC), see icons/LICENSE
 
 THEMES = {
     "dark": {
@@ -76,30 +76,16 @@ THEMES = {
 FONT_SIZES = {"user": 13, "ai": 13, "entry": 13}
 
 
-def theme_icon(kind, color, size=18):
-    """Draw a sun or moon icon as a Tk image (supersampled for smooth edges).
+def load_icon(name, color, size=18):
+    """Load a Lucide icon from icons/ as a Tk image, tinted to the given color.
 
-    Built as PNG data for tk.PhotoImage so it doesn't need PIL.ImageTk
-    (a separate distro package on Fedora).
+    The PNGs are white masks; only their alpha is used. Built as PNG data for
+    tk.PhotoImage so it doesn't need PIL.ImageTk (a separate distro package on Fedora).
     """
-    s = size * 4
-    img = Image.new("RGBA", (s, s), (0, 0, 0, 0))
-    d = ImageDraw.Draw(img)
-    c = s / 2
-    if kind == "sun":
-        r = s * 0.2
-        d.ellipse((c - r, c - r, c + r, c + r), fill=color)
-        for i in range(8):
-            a = i * math.pi / 4
-            x1, y1 = c + math.cos(a) * s * 0.3, c + math.sin(a) * s * 0.3
-            x2, y2 = c + math.cos(a) * s * 0.44, c + math.sin(a) * s * 0.44
-            d.line((x1, y1, x2, y2), fill=color, width=int(s * 0.07))
-    else:
-        r = s * 0.38
-        d.ellipse((c - r, c - r, c + r, c + r), fill=color)
-        o = s * 0.2
-        d.ellipse((c - r + o, c - r - o * 0.6, c + r + o, c + r - o * 0.6), fill=(0, 0, 0, 0))
-    img = img.resize((size, size), Image.LANCZOS)
+    mask = Image.open(ICON_DIR / f"{name}.png").convert("RGBA").getchannel("A")
+    mask = mask.resize((size, size), Image.LANCZOS)
+    img = Image.new("RGBA", (size, size), color)
+    img.putalpha(mask)
     buf = io.BytesIO()
     img.save(buf, "PNG")
     return tk.PhotoImage(data=base64.b64encode(buf.getvalue()))
@@ -128,7 +114,7 @@ class MyApp(ctk.CTk):
             state="disabled",
             font=("TkDefaultFont", FONT_SIZES["ai"]),
         )
-        self.response.grid(row=0, column=1, sticky="nsew", padx=10, pady=(10, 5))
+        self.response.grid(row=0, column=1, sticky="nsew", padx=10, pady=(10, 0))
         tb = self.response._textbox
         tb.configure(padx=8, pady=6)
         # user bubbles sit on their own right-justified line
@@ -143,7 +129,7 @@ class MyApp(ctk.CTk):
             wrap="word",
             font=("TkDefaultFont", FONT_SIZES["entry"]),
         )
-        self.entry.grid(row=1, column=1, sticky="ew", padx=10, pady=(5, 10))
+        self.entry.grid(row=2, column=1, sticky="ew", padx=10, pady=(0, 10))
         self.entry.bind("<Return>", self.on_enter)
         self.entry.bind("<Shift-Return>", self.on_shift_enter)
         self.bind("<Escape>", lambda e: self.stop())
@@ -151,8 +137,43 @@ class MyApp(ctk.CTk):
         # only shown while a reply is streaming, over the right edge of the entry
         self.stop_btn = ctk.CTkButton(self.entry, text="Stop", width=60, command=self.stop)
 
+        # button bar between chat and entry: sidebar toggle and new chat on the left,
+        # model and theme on the right
+        self.toolbar = ctk.CTkFrame(self, corner_radius=self.response.cget("corner_radius"))
+        self.toolbar.grid(row=1, column=1, sticky="ew", padx=10, pady=5)
+        self.toolbar.grid_columnconfigure(2, weight=1)
+
+        self.sidebar_btn = ctk.CTkButton(
+            self.toolbar, text="", width=32, command=self.toggle_sidebar
+        )
+        self.sidebar_btn.grid(row=0, column=0, padx=(6, 2), pady=6)
+        self.new_btn = ctk.CTkButton(self.toolbar, text="", width=32, command=self.new_chat)
+        self.new_btn.grid(row=0, column=1, pady=6)
+
+        models = self.get_models()
+        last = self.settings.get("model", MODEL)
+        self.model = last if last in models else (MODEL if MODEL in models else models[0])
+        self.model_menu = ctk.CTkOptionMenu(
+            self.toolbar,
+            values=models,
+            width=200,
+            command=self.set_model,
+        )
+        self.model_menu.set(self.model)
+        self.title(f"LULIM - {self.model}")
+        self.model_menu.grid(row=0, column=3, padx=(0, 4), pady=6)
+
+        self.theme_btn = ctk.CTkButton(
+            self.toolbar,
+            text="",
+            width=32,
+            command=self.toggle_theme,
+        )
+        self.theme_btn.grid(row=0, column=4, padx=(0, 6), pady=6)
+
+        # sidebar: just the saved chats
         self.sidebar = ctk.CTkFrame(self, width=250, corner_radius=0, fg_color="transparent")
-        self.sidebar.grid(row=0, column=0, rowspan=2, sticky="ns")
+        self.sidebar.grid(row=0, column=0, rowspan=3, sticky="ns")
         self.sidebar.grid_propagate(False)
         self.sidebar.grid_rowconfigure(0, weight=1)
         self.sidebar.grid_columnconfigure(0, weight=1)
@@ -165,39 +186,21 @@ class MyApp(ctk.CTk):
         self.container.grid_columnconfigure(0, weight=1)
         self.container.grid_rowconfigure(1, weight=1)
 
-        self.new_btn = ctk.CTkButton(
+        self.list_title = ctk.CTkLabel(
             self.container,
-            text="New Chat",
-            command=self.new_chat,
+            text="Previous chats",
+            anchor="w",
+            font=("TkDefaultFont", FONT_SIZES["ai"], "bold"),
         )
-        self.new_btn.grid(row=0, column=0, columnspan=2, sticky="ew", padx=10, pady=10)
+        self.list_title.grid(row=0, column=0, sticky="ew", padx=15, pady=(10, 0))
 
         self.chat_list = ctk.CTkScrollableFrame(self.container, fg_color="transparent")
-        self.chat_list.grid(row=1, column=0, columnspan=2, sticky="nsew", padx=5, pady=(0, 10))
+        self.chat_list.grid(row=1, column=0, sticky="nsew", padx=5, pady=(4, 10))
         self.chat_list.grid_columnconfigure(0, weight=1)
         self.chat_list._parent_canvas.bind(
             "<Configure>", lambda e: self.after_idle(self.update_scrollbar), add="+"
         )
-
-        models = self.get_models()
-        last = self.settings.get("model", MODEL)
-        self.model = last if last in models else (MODEL if MODEL in models else models[0])
-        self.model_menu = ctk.CTkOptionMenu(
-            self.container,
-            values=models,
-            command=self.set_model,
-        )
-        self.model_menu.set(self.model)
-        self.title(f"LULIM - {self.model}")
-        self.model_menu.grid(row=2, column=0, sticky="ew", padx=(10, 5), pady=(0, 10))
-
-        self.theme_btn = ctk.CTkButton(
-            self.container,
-            text="",
-            width=28,
-            command=self.toggle_theme,
-        )
-        self.theme_btn.grid(row=2, column=1, padx=(0, 10), pady=(0, 10))
+        self.bind("<Control-b>", lambda e: self.toggle_sidebar())
 
         self.history = []
         self.q = queue.Queue()
@@ -206,9 +209,12 @@ class MyApp(ctk.CTk):
         self.stop_event = threading.Event()
         self.resp = None
         self.chat_id = None
+        self.armed = self.armed_btn = None  # chat whose trash can was clicked once
 
         CHAT_DIR.mkdir(parents=True, exist_ok=True)
         self.apply_theme()
+        if self.settings.get("sidebar_hidden"):
+            self.sidebar.grid_remove()
         self.protocol("WM_DELETE_WINDOW", self.close)
 
     def get_models(self):
@@ -254,6 +260,14 @@ class MyApp(ctk.CTk):
         self.title(f"LULIM - {choice}")
         self.save_setting("model", choice)
 
+    def toggle_sidebar(self):
+        hidden = self.sidebar.winfo_manager() == ""
+        if hidden:
+            self.sidebar.grid()
+        else:
+            self.sidebar.grid_remove()
+        self.save_setting("sidebar_hidden", not hidden)
+
     def toggle_theme(self):
         self.theme_name = "light" if self.theme_name == "dark" else "dark"
         self.save_setting("theme", self.theme_name)
@@ -275,13 +289,19 @@ class MyApp(ctk.CTk):
         for b in self.bubbles:
             b.configure(fg_color=t["bubble"], text_color=t["bubble_text"], bg_color=t["surface"])
         self.container.configure(fg_color=t["surface"])
+        self.list_title.configure(text_color=t["text"])
         self.chat_list.configure(
             fg_color=t["surface"],
             scrollbar_button_color=t["scrollbar"],
             scrollbar_button_hover_color=t["scrollbar_hover"],
         )
-        for btn in (self.new_btn, self.stop_btn):
-            btn.configure(fg_color=t["button"], hover_color=t["button_hover"], text_color=t["text"])
+        self.toolbar.configure(fg_color=t["surface"])
+        # flat icon buttons on the bar: just the icon, highlighted on hover
+        for btn in (self.sidebar_btn, self.new_btn, self.theme_btn):
+            btn.configure(fg_color="transparent", hover_color=t["list_hover"])
+        self.stop_btn.configure(
+            fg_color=t["button"], hover_color=t["button_hover"], text_color=t["text"]
+        )
         self.stop_btn.configure(bg_color=t["surface"])  # rounded corners sit on the entry
         self.model_menu.configure(
             fg_color=t["button"],
@@ -292,17 +312,20 @@ class MyApp(ctk.CTk):
             dropdown_hover_color=t["list_hover"],
             dropdown_text_color=t["text"],
         )
-        # show the theme you'd switch to: sun while dark, moon while light
-        icon = "sun" if self.theme_name == "dark" else "moon"
+        # the theme button shows the theme you'd switch to: sun while dark, moon while light
+        theme = "sun" if self.theme_name == "dark" else "moon"
         size = round(18 * self.theme_btn._get_widget_scaling())
-        self._theme_img = theme_icon(icon, t["text"], size)  # keep a reference
+        self._icons = {}  # keep references so Tk doesn't drop the images
         with warnings.catch_warnings():
-            warnings.simplefilter("ignore")  # plain Tk image: we scale it ourselves
-            self.theme_btn.configure(
-                image=self._theme_img,
-                fg_color=t["button"],
-                hover_color=t["button_hover"],
-            )
+            warnings.simplefilter("ignore")  # plain Tk images: we scale them ourselves
+            for btn, name in ((self.sidebar_btn, "panel-left"), (self.new_btn, "square-pen"),
+                              (self.theme_btn, theme)):
+                self._icons[name] = load_icon(name, t["text"], size)
+                btn.configure(image=self._icons[name])
+        list_size = round(16 * self.theme_btn._get_widget_scaling())
+        self._icons["message-square"] = load_icon("message-square", t["muted"], list_size)
+        self._icons["trash-2"] = load_icon("trash-2", t["muted"], list_size)
+        self._icons["trash-armed"] = load_icon("trash-2", t["error"], list_size)
         self.refresh_list()
 
     def close(self):
@@ -534,17 +557,30 @@ class MyApp(ctk.CTk):
             w.destroy()
         for i, f in enumerate(sorted(CHAT_DIR.glob("*.json"), reverse=True)):
             title = json.loads(f.read_text())["title"]
-            btn = ctk.CTkButton(
-                self.chat_list,
-                text=title,
-                anchor="w",
-                fg_color="transparent",
-                hover_color=self.t["list_hover"],
-                text_color=self.t["text"],
-                command=lambda f=f: self.load_chat(f),
-            )
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")  # plain Tk image: we scale it ourselves
+                btn = ctk.CTkButton(
+                    self.chat_list,
+                    text=title,
+                    image=self._icons["message-square"],
+                    compound="left",
+                    anchor="w",
+                    fg_color="transparent",
+                    hover_color=self.t["list_hover"],
+                    text_color=self.t["text"],
+                    command=lambda f=f: self.load_chat(f),
+                )
+                trash = ctk.CTkButton(
+                    self.chat_list,
+                    text="",
+                    image=self._icons["trash-2"],
+                    width=28,
+                    fg_color="transparent",
+                    hover_color=self.t["list_hover"],
+                )
+            trash.configure(command=lambda f=f, b=trash: self.trash_click(f, b))
             btn.grid(row=i, column=0, sticky="ew", pady=1)
-            btn.bind("<Button-3>", lambda e, f=f: self.chat_menu(e, f))
+            trash.grid(row=i, column=1, pady=1)
         self.after_idle(self.update_scrollbar)
 
     def update_scrollbar(self):
@@ -555,13 +591,21 @@ class MyApp(ctk.CTk):
         else:
             self.chat_list._scrollbar.grid_remove()
 
-    def chat_menu(self, event, path):
-        menu = self.themed_menu()
-        menu.add_command(label="Delete", command=lambda: self.delete_chat(path))
-        try:
-            menu.tk_popup(event.x_root, event.y_root)
-        finally:
-            menu.grab_release()
+    def trash_click(self, path, btn):
+        """First click arms the trash can (turns red), a second within 3s deletes."""
+        if self.armed == path:
+            self.armed = self.armed_btn = None
+            self.delete_chat(path)
+            return
+        self.disarm()
+        self.armed, self.armed_btn = path, btn
+        btn.configure(image=self._icons["trash-armed"])
+        self.after(3000, lambda: self.armed == path and self.disarm())
+
+    def disarm(self):
+        btn, self.armed, self.armed_btn = self.armed_btn, None, None
+        if btn is not None and btn.winfo_exists():
+            btn.configure(image=self._icons["trash-2"])
 
     def delete_chat(self, path):
         if self.generating:

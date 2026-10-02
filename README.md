@@ -16,7 +16,7 @@ built with Python and [CustomTkinter](https://github.com/TomSchimansky/CustomTki
   separately from the answer, with how long the model thought
 - Shows tokens, tokens/sec and how full the context window is for each reply
 - Reopen any saved chat and keep going: the whole conversation is sent back to the model
-- Saves chats automatically and lists them in the sidebar; right-click a chat to delete it
+- Saves chats automatically and lists them in the sidebar; click a chat's trash can twice to delete it
 - Right-click your own messages to copy them
 - Dark and light themes
 - Unloads the model from memory when you close the window
@@ -80,6 +80,9 @@ lets the model remember more of a long chat, but uses more memory (VRAM/RAM).
 - `main.py` is the window, the sidebar, the Ollama connection and chat saving
 - `render.py` is the streaming Markdown renderer for replies
 - `icon.png` is the window icon
+- `icons/` holds the toolbar and chat list icons from [Lucide](https://lucide.dev)
+  (ISC license, see `icons/LICENSE`). They are white PNGs tinted to the theme at runtime;
+  to add one, convert the Lucide SVG to a 96×96 white PNG and load it by name with `load_icon`
 
 ## License
 
