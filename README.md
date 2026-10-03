@@ -17,12 +17,17 @@ built with Python and [CustomTkinter](https://github.com/TomSchimansky/CustomTki
   separately from the answer, with how long the model thought
 - Shows tokens, tokens/sec and how full the context window is for each reply
 - Reopen any saved chat and keep going: the whole conversation is sent back to the model
-- Saves chats automatically and lists them in the sidebar; right-click a chat to rename it,
-  click its trash can twice to delete it
+- Saves chats automatically and lists them in the sidebar; right-click a chat to rename it
+  or export it as a Markdown file (its images are copied to a folder next to it),
+  click its trash can twice to delete it. The search box above the list filters chats
+  by name and message text
 - Copy any reply, or regenerate the latest one, from the links under it;
   a failed send (e.g. Ollama not running) gets a Retry link
 - Right-click your own messages to copy them, or edit one and send it again
   (the chat is cut off at that message)
+- Attach images for models that can see them (Ollama reports this per model, so the
+  paperclip button only shows for those): pick files with the paperclip, or paste a
+  screenshot or a copied image file with Ctrl+V. Click a picture in the chat to open it
 - A system prompt for all chats (the scroll button in the toolbar), e.g. "be concise,
   best option first"; it's sent with every request but not saved into chats
 - Dark and light themes
@@ -35,6 +40,8 @@ built with Python and [CustomTkinter](https://github.com/TomSchimansky/CustomTki
   with at least one model pulled
 - Python packages: `customtkinter`, `requests`, `pillow`
 - Optional: `pygments` for syntax highlighting in code blocks
+- Optional, for images: `wl-paste` (package `wl-clipboard`) to paste images on Wayland, and
+  `kdialog` or `zenity` for the desktop's own file picker (otherwise Tk's basic one is used)
 
 On Fedora, Tk is a separate package:
 
@@ -70,6 +77,7 @@ or `python3 main.py`.
 - **Esc** stops a reply
 - **Ctrl+N** starts a new chat
 - **Ctrl+B** shows or hides the sidebar
+- **Ctrl+F** searches your chats (Esc clears the search)
 - **Ctrl +** / **Ctrl −** make the chat text bigger or smaller, **Ctrl+0** resets it
 
 ## Configuration
@@ -80,7 +88,7 @@ These settings are constants at the top of `main.py`:
 |------------|-----------------------------------------|-------------------------------------|
 | `MODEL`    | `qwen2.5-coder:7b`                      | Model used if no other is chosen   |
 | `URL`      | `http://localhost:11434/api/chat`       | Ollama chat endpoint                |
-| `CHAT_DIR` | `~/.local/share/quen/chats`             | Where chats are saved               |
+| `CHAT_DIR` | `~/.local/share/quen/chats`             | Where chats are saved; attached images go in `images/` inside it |
 | `NUM_CTX`  | `16384`                                 | Context window in tokens, capped at the model's max |
 
 Your last model and theme are remembered in `~/.local/share/quen/settings.json`.
