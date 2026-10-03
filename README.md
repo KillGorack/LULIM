@@ -3,7 +3,8 @@
 A small desktop chat app for local LLMs running in [Ollama](https://ollama.com),
 built with Python and [CustomTkinter](https://github.com/TomSchimansky/CustomTkinter).
 
-<img width="1110" height="597" alt="image" src="https://github.com/user-attachments/assets/f6d745c8-adba-4e41-952d-c2e44adb8cc3" />
+<img width="1143" height="566" alt="image" src="https://github.com/user-attachments/assets/048a7316-49f6-490b-bef2-f39822e908b6" />
+
 
 ## Features
 
