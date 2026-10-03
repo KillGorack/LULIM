@@ -239,6 +239,9 @@ class MyApp(ctk.CTk):
         self.entry.grid(row=3, column=1, sticky="ew", padx=10, pady=(0, 10))
         self.entry.bind("<Return>", self.on_enter)
         self.entry.bind("<Control-v>", self.on_paste)
+        # Tk's own Ctrl+A jumps to the start of the line; select everything instead
+        self.entry.bind("<Control-a>", lambda e: (
+            self.entry._textbox.tag_add("sel", "1.0", "end-1c"), "break")[1])
         self.entry.bind("<Shift-Return>", self.on_shift_enter)
         self.bind("<Escape>", lambda e: self.stop())
 
