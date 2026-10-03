@@ -11,23 +11,72 @@ import tkinter as tk
 import tkinter.font as tkfont
 import webbrowser
 
+try:  # optional: code blocks stay plain without it
+    from pygments.lexers import get_lexer_by_name
+    from pygments.token import Comment, Keyword, Name, Number, String
+    from pygments.util import ClassNotFound
+except ImportError:
+    get_lexer_by_name = None
+
 BULLETS = ["•", "◦", "▪", "▪"]
 THINK_OPEN, THINK_CLOSE = "<think>", "</think>"
+# Pygments token type -> tag, first match wins; colors come from the theme
+SYNTAX = [] if get_lexer_by_name is None else [
+    (Comment.Preproc, "syn_keyword"),
+    (Comment, "syn_comment"),
+    (String, "syn_string"),
+    (Number, "syn_number"),
+    (Keyword, "syn_keyword"),
+    (Name.Tag, "syn_keyword"),
+    (Name.Builtin, "syn_builtin"),
+    (Name.Function, "syn_func"),
+    (Name.Class, "syn_func"),
+    (Name.Decorator, "syn_func"),
+    (Name.Attribute, "syn_func"),
+]
+SYNTAX_TAGS = ("syn_keyword", "syn_comment", "syn_string", "syn_number", "syn_builtin",
+               "syn_func")
 
 
 class ReplyRenderer:
     def __init__(self, textbox, size):
         self.box = textbox  # the CTkTextbox (for scaling)
         self.tb = tb = textbox._textbox
-        self.scale = scale = textbox._get_widget_scaling()
+        self.scale = textbox._get_widget_scaling()
         self.t = None
+        fam = tkfont.nametofont("TkDefaultFont").actual("family")
+        # code header labels: fixed size, kept for the widget's lifetime (dropping a
+        # tkfont.Font deletes it from Tk, which would reset labels still using it)
+        self.head_font = tkfont.Font(family=fam, size=-round(11 * self.scale))
+        self.set_size(size)
+        # priority (low -> high): inline styles beat line styles, headings beat bold
+        for tag in ("ai", "error", "quote", "li0", "li1", "li2", "li3", "bold", "italic",
+                    "bolditalic", "strike", "h1", "h2", "h3", "table", "inline", "inline_gap",
+                    "link", "code", "think", "think_head", "stats"):
+            tb.tag_raise(tag)
+        for tag in SYNTAX_TAGS:  # above "code" so their colors win
+            tb.tag_config(tag)
+            tb.tag_raise(tag)
+        for tag in ("link", "think_head", "action"):
+            tb.tag_bind(tag, "<Enter>", lambda e: tb.configure(cursor="hand2"))
+            tb.tag_bind(tag, "<Leave>", lambda e: tb.configure(cursor="xterm"))
+
+        self.code_heads, self.rules, self.code_blocks = [], [], {}
+        self.action_labels = {}  # action link -> its label while it shows e.g. "Copied"
+        self.counter = 0
+        self.start()
+
+    # ------------------------------------------------------------ theme / layout
+
+    def set_size(self, size):
+        """(Re)build the fonts for text size `size`; used again when zooming."""
+        tb, scale = self.tb, self.scale
         px = lambda n: -round(n * scale)  # negative = pixels, matching CTk
         sp = lambda n: round(n * scale)
         fam = tkfont.nametofont("TkDefaultFont").actual("family")
         mono = tkfont.nametofont("TkFixedFont").actual("family")
         code_font = (mono, px(size))
         small = (fam, px(size - 2))
-        self.head_font = tkfont.Font(family=fam, size=px(11))
 
         tb.tag_config("ai", font=(fam, px(size)), lmargin1=4, lmargin2=4, rmargin=4,
                       spacing2=2, spacing3=2)
@@ -58,20 +107,7 @@ class ReplyRenderer:
         tb.tag_config("think_head", font=small, spacing1=sp(2), spacing3=sp(6), lmargin1=4)
         tb.tag_config("think", font=small, lmargin1=sp(16), lmargin2=sp(16), spacing3=sp(2))
         tb.tag_config("stats", font=small, lmargin1=4, spacing1=sp(6))
-        # priority (low -> high): inline styles beat line styles, headings beat bold
-        for tag in ("ai", "error", "quote", "li0", "li1", "li2", "li3", "bold", "italic",
-                    "bolditalic", "strike", "h1", "h2", "h3", "table", "inline", "inline_gap",
-                    "link", "code", "think", "think_head", "stats"):
-            tb.tag_raise(tag)
-        for tag in ("link", "think_head"):
-            tb.tag_bind(tag, "<Enter>", lambda e: tb.configure(cursor="hand2"))
-            tb.tag_bind(tag, "<Leave>", lambda e: tb.configure(cursor="xterm"))
 
-        self.code_heads, self.rules, self.code_blocks = [], [], {}
-        self.counter = 0
-        self.start()
-
-    # ------------------------------------------------------------ theme / layout
 
     def apply_theme(self, t):
         self.t = t
@@ -84,6 +120,8 @@ class ReplyRenderer:
             tb.tag_config(tag, background=t["code_bg"], lmargincolor=t["code_bg"],
                           rmargincolor=t["code_bg"])
         tb.tag_config("code", foreground=t["text"])
+        for tag in SYNTAX_TAGS:
+            tb.tag_config(tag, foreground=t[tag])
         tb.tag_config("inline", background=t["code_bg"], foreground=t["text"])
         tb.tag_config("link", foreground=t["link"])
         for bar, *labels in self.code_heads:
@@ -122,13 +160,16 @@ class ReplyRenderer:
     def insert(self, text, tags=()):
         if not text:
             return
+        follow = self.at_bottom()
         self.tb.configure(state="normal")
         self.tb.insert("end", text, tags)
-        self.tb.see("end")
+        if follow:
+            self.tb.see("end")
         self.tb.configure(state="disabled")
 
     def embed(self, widget, line_tag):
         tb = self.tb
+        follow = self.at_bottom()
         tb.configure(state="normal")
         if tb.get("end-2c", "end-1c") not in ("", "\n"):
             tb.insert("end", "\n")
@@ -138,8 +179,14 @@ class ReplyRenderer:
         tb.window_create("end", window=widget)
         tb.insert("end", "\n")
         tb.tag_add(line_tag, start, "end-1c")
-        tb.see("end")
+        if follow:
+            tb.see("end")
         tb.configure(state="disabled")
+
+    def at_bottom(self):
+        """True if the end of the chat is on screen: only then does new output scroll it.
+        Scrolling up while a reply streams leaves the view where it is."""
+        return self.tb.bbox("end-1c") is not None
 
     def new_id(self, prefix):
         self.counter += 1
@@ -203,7 +250,9 @@ class ReplyRenderer:
             text, self.raw = self.raw, ""
             self.markdown(text)
 
-    def finish(self, stats=None):
+    def finish(self, stats=None, stopped=False, actions=()):
+        """End the reply and add its footer line: stats, "stopped", then action links
+        given as (label, callback, label shown briefly after a click or None)."""
         if self.think_state == "in":
             self.think(self.raw)
             self.raw = ""
@@ -219,15 +268,61 @@ class ReplyRenderer:
             self.fence("")  # model never closed the block
         if self.tb.get("end-2c", "end-1c") not in ("", "\n"):
             self.insert("\n")
+        parts = []
         if stats and stats.get("tokens"):
-            line = f"{stats['tps']:.1f} tok/s  ·  {stats['tokens']} tokens"
+            parts.append(f"{stats['tps']:.1f} tok/s  ·  {stats['tokens']} tokens")
             if stats.get("ctx_max"):
                 pct = round(100 * stats["ctx"] / stats["ctx_max"])
-                line += f"  ·  context {stats['ctx']:,} / {stats['ctx_max']:,} ({pct}%)"
-            self.insert(line + "\n", ("stats",))
+                parts.append(f"context {stats['ctx']:,} / {stats['ctx_max']:,} ({pct}%)")
+        if stopped:
+            parts.append("stopped")
+        line = "  ·  ".join(parts)
+        if not line and not actions:
+            return
+        self.insert(line, ("stats",))
+        for i, (label, callback, flash) in enumerate(actions):
+            group = f"act_{label}"  # separator + link, so drop_actions() can remove both
+            sep = ("      " if i == 0 else "  ·  ") if line or i else ""
+            self.insert(sep, ("stats", group))
+            link = self.new_id("action")
+            self.insert(label, ("stats", "action", group, link))
+            self.tb.tag_bind(link, "<Button-1>",
+                             lambda e, c=callback, l=link, f=flash: self.run_action(c, l, f))
+        self.insert("\n", ("stats",))
 
-    def mark_stopped(self):
-        self.insert("stopped\n", ("stats",))
+    def run_action(self, callback, link, flash):
+        if flash:
+            self.relabel(link, flash)
+            self.tb.after(1500, lambda: self.relabel(link, None))
+        callback()
+
+    def relabel(self, link, text):
+        """Swap an action link's text (e.g. Copy -> Copied); None restores the original."""
+        tb = self.tb
+        r = tb.tag_ranges(link)
+        if not r:
+            return  # chat was cleared meanwhile
+        old = tb.get(r[0], r[1])
+        if text is None:
+            text = self.action_labels.pop(link, old)
+        else:
+            self.action_labels.setdefault(link, old)
+        tags = tb.tag_names(r[0])
+        tb.configure(state="normal")
+        tb.delete(r[0], r[1])
+        tb.insert(r[0], text, tags)
+        tb.configure(state="disabled")
+
+    def drop_actions(self, *labels):
+        """Remove action links (with their separators), e.g. Regenerate once it no
+        longer applies to the latest reply."""
+        tb = self.tb
+        tb.configure(state="normal")
+        for label in labels:
+            r = tb.tag_ranges(f"act_{label}")
+            for k in range(len(r) - 2, -1, -2):  # back to front keeps indices valid
+                tb.delete(r[k], r[k + 1])
+        tb.configure(state="disabled")
 
     def show_error(self, msg):
         self.finish()
@@ -333,6 +428,8 @@ class ReplyRenderer:
             if self.in_code:
                 self.code_blocks[self.block_id] += chunk
                 self.insert(chunk, ("code",))
+                if i != -1:
+                    self.highlight()
             else:
                 self.inline(chunk, line_end=i != -1)
             if i != -1:
@@ -393,11 +490,43 @@ class ReplyRenderer:
             self.code_blocks[self.block_id] = ""
             self.add_code_header(lang or "code", self.block_id)
             self.insert("\n", ("code_pad",))
+            self.lexer = self.get_lexer(lang)
+            # left gravity: stays put while the block's text is added after it
+            self.tb.mark_set("code_start", "end-1c")
+            self.tb.mark_gravity("code_start", "left")
         else:
             self.in_code = False
+            self.highlight()  # a last line without a newline
             if not self.code_blocks[self.block_id].endswith("\n"):
                 self.insert("\n", ("code",))
             self.insert("\n", ("code_pad",))
+
+    @staticmethod
+    def get_lexer(lang):
+        """Pygments lexer for the fence's language, or None: no name, unknown name
+        or no Pygments all mean plain code (guessing the language is too often wrong)."""
+        if get_lexer_by_name is None or not lang:
+            return None
+        try:
+            # keep the text exactly as inserted so token offsets match the widget
+            return get_lexer_by_name(lang.split()[0], stripnl=False, ensurenl=False)
+        except ClassNotFound:
+            return None
+
+    def highlight(self):
+        """Re-color the code block streamed so far. The whole block is lexed again each
+        time so multi-line strings and comments come out right; blocks are small."""
+        if not self.lexer:
+            return
+        tb = self.tb
+        for tag in SYNTAX_TAGS:
+            tb.tag_remove(tag, "code_start", "end")
+        pos = 0
+        for ttype, value in self.lexer.get_tokens(self.code_blocks[self.block_id]):
+            tag = next((tag for base, tag in SYNTAX if ttype in base), None)
+            if tag and value.strip():
+                tb.tag_add(tag, f"code_start+{pos}c", f"code_start+{pos + len(value)}c")
+            pos += len(value)
 
     def add_code_header(self, lang, block):
         t = self.t

@@ -12,12 +12,19 @@ built with Python and [CustomTkinter](https://github.com/TomSchimansky/CustomTki
 - Lists every model you have installed in Ollama and lets you switch between them
   (the window title shows the current model)
 - Renders Markdown as it arrives: code blocks, bold/italic, lists, quotes, headings and links
+- Syntax highlighting in code blocks that name their language (needs the optional `pygments` package)
 - Shows the reasoning of thinking models (Ollama's `thinking` field or `<think>` tags)
   separately from the answer, with how long the model thought
 - Shows tokens, tokens/sec and how full the context window is for each reply
 - Reopen any saved chat and keep going: the whole conversation is sent back to the model
-- Saves chats automatically and lists them in the sidebar; click a chat's trash can twice to delete it
-- Right-click your own messages to copy them
+- Saves chats automatically and lists them in the sidebar; right-click a chat to rename it,
+  click its trash can twice to delete it
+- Copy any reply, or regenerate the latest one, from the links under it;
+  a failed send (e.g. Ollama not running) gets a Retry link
+- Right-click your own messages to copy them, or edit one and send it again
+  (the chat is cut off at that message)
+- A system prompt for all chats (the scroll button in the toolbar), e.g. "be concise,
+  best option first"; it's sent with every request but not saved into chats
 - Dark and light themes
 - Unloads the model from memory when you close the window
 
@@ -27,6 +34,7 @@ built with Python and [CustomTkinter](https://github.com/TomSchimansky/CustomTki
 - [Ollama](https://ollama.com) running locally on the default port (`11434`)
   with at least one model pulled
 - Python packages: `customtkinter`, `requests`, `pillow`
+- Optional: `pygments` for syntax highlighting in code blocks
 
 On Fedora, Tk is a separate package:
 
@@ -40,6 +48,7 @@ sudo dnf install python3-tkinter
 git clone https://github.com/KillGorack/LULIM.git
 cd LULIM
 pip install --user customtkinter requests pillow
+pip install --user pygments  # optional: syntax highlighting
 ```
 
 Pull a model if you don't have one yet. The default is `qwen2.5-coder:7b`:
@@ -58,7 +67,10 @@ or `python3 main.py`.
 
 - **Enter** sends the message
 - **Shift+Enter** adds a new line
-- **New Chat** starts a new conversation
+- **Esc** stops a reply
+- **Ctrl+N** starts a new chat
+- **Ctrl+B** shows or hides the sidebar
+- **Ctrl +** / **Ctrl −** make the chat text bigger or smaller, **Ctrl+0** resets it
 
 ## Configuration
 

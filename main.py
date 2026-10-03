@@ -32,9 +32,9 @@ THEMES = {
     "dark": {
         "window": "#262626",
         "surface": "#171717",
-        "text": "#f5f5f5",
+        "text": "#b1b1b1",
         "bubble": "#2e2e2e",
-        "bubble_text": "#f5f5f5",
+        "bubble_text": "#b1b1b1",
         "ai_text": "#d4d4d4",
         "error": "#f87171",
         "code_bg": "#262626",
@@ -49,6 +49,12 @@ THEMES = {
         "list_hover": "#333333",
         "scrollbar": "#404040",
         "scrollbar_hover": "#525252",
+        "syn_keyword": "#c09bc8",
+        "syn_string": "#a3b88a",
+        "syn_comment": "#767676",
+        "syn_number": "#d1a173",
+        "syn_builtin": "#80b3ad",
+        "syn_func": "#8eaed4",
     },
     "light": {
         "window": "#bdb5a3",
@@ -70,10 +76,22 @@ THEMES = {
         "list_hover": "#cbc2ae",
         "scrollbar": "#a89e8a",
         "scrollbar_hover": "#8c806b",
+        "syn_keyword": "#7a3d6c",
+        "syn_string": "#4d6a2c",
+        "syn_comment": "#7d725e",
+        "syn_number": "#8a5220",
+        "syn_builtin": "#2c6863",
+        "syn_func": "#2f5d8a",
     },
 }
 
-FONT_SIZES = {"user": 13, "ai": 13, "entry": 13}
+FONT_SIZE = 13  # chat and input text; Ctrl +/- change it, Ctrl+0 resets
+FONT_MIN, FONT_MAX = 9, 24
+
+
+def strip_think(text):
+    """Reply text without <think> blocks (older setups put reasoning in the content)."""
+    return re.sub(r"<think>.*?</think>\s*", "", text, flags=re.S)
 
 
 def load_icon(name, color, size=18):
@@ -98,6 +116,7 @@ class MyApp(ctk.CTk):
         self.geometry("800x500")
         self.title("LULIM")
         self.settings = self.load_settings()
+        self.font_size = self.settings.get("font_size", FONT_SIZE)
         self.theme_name = self.settings.get("theme", "dark")
         if self.theme_name not in THEMES:
             self.theme_name = "dark"
@@ -112,14 +131,14 @@ class MyApp(ctk.CTk):
             self,
             wrap="word",
             state="disabled",
-            font=("TkDefaultFont", FONT_SIZES["ai"]),
+            font=("TkDefaultFont", self.font_size),
         )
         self.response.grid(row=0, column=1, sticky="nsew", padx=10, pady=(10, 0))
         tb = self.response._textbox
         tb.configure(padx=8, pady=6)
         # user bubbles sit on their own right-justified line
         tb.tag_config("user_line", justify="right", spacing1=14, spacing3=12, rmargin=2)
-        self.renderer = ReplyRenderer(self.response, FONT_SIZES["ai"])
+        self.renderer = ReplyRenderer(self.response, self.font_size)
         tb.bind("<Configure>", lambda e: self.rewrap_bubbles(), add="+")
         self.bubbles = []
 
@@ -127,7 +146,7 @@ class MyApp(ctk.CTk):
             self,
             height=70,
             wrap="word",
-            font=("TkDefaultFont", FONT_SIZES["entry"]),
+            font=("TkDefaultFont", self.font_size),
         )
         self.entry.grid(row=2, column=1, sticky="ew", padx=10, pady=(0, 10))
         self.entry.bind("<Return>", self.on_enter)
@@ -140,7 +159,7 @@ class MyApp(ctk.CTk):
         # button bar between chat and entry: sidebar toggle and new chat on the left,
         # model and theme on the right
         self.toolbar = ctk.CTkFrame(self, corner_radius=self.response.cget("corner_radius"))
-        self.toolbar.grid(row=1, column=1, sticky="ew", padx=10, pady=5)
+        self.toolbar.grid(row=1, column=1, sticky="ew", padx=10, pady=10)
         self.toolbar.grid_columnconfigure(2, weight=1)
 
         self.sidebar_btn = ctk.CTkButton(
@@ -150,9 +169,16 @@ class MyApp(ctk.CTk):
         self.new_btn = ctk.CTkButton(self.toolbar, text="", width=32, command=self.new_chat)
         self.new_btn.grid(row=0, column=1, pady=6)
 
+        # shown in the bar's empty middle while Ollama can't be reached
+        self.status = ctk.CTkLabel(self.toolbar, text="", anchor="e")
+        self.status.grid(row=0, column=2, sticky="e", padx=8)
+        self.note = self.note_job = None  # brief message shown there, e.g. text size
+
         models = self.get_models()
-        last = self.settings.get("model", MODEL)
-        self.model = last if last in models else (MODEL if MODEL in models else models[0])
+        self.online = True
+        self.set_online(models is not None)
+        models = models or [MODEL]
+        self.model = self.pick_model(models)
         self.model_menu = ctk.CTkOptionMenu(
             self.toolbar,
             values=models,
@@ -163,13 +189,19 @@ class MyApp(ctk.CTk):
         self.title(f"LULIM - {self.model}")
         self.model_menu.grid(row=0, column=3, padx=(0, 4), pady=6)
 
+        self.prompt_btn = ctk.CTkButton(
+            self.toolbar, text="", width=32, command=self.edit_system_prompt
+        )
+        self.prompt_btn.grid(row=0, column=4, padx=(0, 2), pady=6)
+        self.prompt_win = None
+
         self.theme_btn = ctk.CTkButton(
             self.toolbar,
             text="",
             width=32,
             command=self.toggle_theme,
         )
-        self.theme_btn.grid(row=0, column=4, padx=(0, 6), pady=6)
+        self.theme_btn.grid(row=0, column=5, padx=(0, 6), pady=6)
 
         # sidebar: just the saved chats
         self.sidebar = ctk.CTkFrame(self, width=250, corner_radius=0, fg_color="transparent")
@@ -190,7 +222,7 @@ class MyApp(ctk.CTk):
             self.container,
             text="Previous chats",
             anchor="w",
-            font=("TkDefaultFont", FONT_SIZES["ai"], "bold"),
+            font=("TkDefaultFont", FONT_SIZE, "bold"),
         )
         self.list_title.grid(row=0, column=0, sticky="ew", padx=15, pady=(10, 0))
 
@@ -201,6 +233,10 @@ class MyApp(ctk.CTk):
             "<Configure>", lambda e: self.after_idle(self.update_scrollbar), add="+"
         )
         self.bind("<Control-b>", lambda e: self.toggle_sidebar())
+        self.bind("<Control-n>", lambda e: self.new_chat())
+        for key, step in (("plus", 1), ("equal", 1), ("KP_Add", 1), ("minus", -1),
+                          ("KP_Subtract", -1), ("Key-0", 0)):
+            self.bind(f"<Control-{key}>", lambda e, s=step: self.zoom(s))
 
         self.history = []
         self.q = queue.Queue()
@@ -210,6 +246,7 @@ class MyApp(ctk.CTk):
         self.resp = None
         self.chat_id = None
         self.armed = self.armed_btn = None  # chat whose trash can was clicked once
+        self.closing = False
 
         CHAT_DIR.mkdir(parents=True, exist_ok=True)
         self.apply_theme()
@@ -218,12 +255,60 @@ class MyApp(ctk.CTk):
         self.protocol("WM_DELETE_WINDOW", self.close)
 
     def get_models(self):
+        """Installed model names, or None if Ollama can't be reached."""
         try:
             r = requests.get(TAGS_URL, timeout=3)
-            names = [m["name"] for m in r.json()["models"]]
-            return names or [MODEL]
+            return [m["name"] for m in r.json()["models"]]
         except Exception:
-            return [MODEL]
+            return None
+
+    def pick_model(self, models):
+        last = self.settings.get("model", MODEL)
+        return last if last in models else (MODEL if MODEL in models else models[0])
+
+    def set_online(self, online):
+        """Show or clear the "not reachable" notice; while offline, check again every 5s."""
+        was = self.online
+        self.online = online
+        self.update_status()
+        if was and not online:
+            self.after(5000, self.check_ollama)
+
+    def update_status(self):
+        """The toolbar notice: a brief note wins over "Ollama not reachable"."""
+        t = THEMES[self.theme_name]
+        if self.note:
+            self.status.configure(text=self.note, text_color=t["muted"])
+        else:
+            self.status.configure(text="" if self.online else "Ollama not reachable",
+                                  text_color=t["error"])
+
+    def show_note(self, text, ms=2000):
+        if self.note_job:
+            self.after_cancel(self.note_job)
+        self.note = text
+        self.update_status()
+
+        def clear():
+            self.note = self.note_job = None
+            self.update_status()
+
+        self.note_job = self.after(ms, clear)
+
+    def check_ollama(self):
+        if self.online:
+            return
+        models = self.get_models()
+        if models is None:
+            self.after(5000, self.check_ollama)
+            return
+        # it's up: reload the model list, which was only a placeholder
+        models = models or [MODEL]
+        self.model = self.pick_model(models)
+        self.model_menu.configure(values=models)
+        self.model_menu.set(self.model)
+        self.title(f"LULIM - {self.model}")
+        self.set_online(True)
 
     def num_ctx(self):
         """Context window for the current model: the setting, capped at the model's max."""
@@ -235,7 +320,7 @@ class MyApp(ctk.CTk):
                 info = r.json().get("model_info", {})
                 limit = next((v for k, v in info.items() if k.endswith(".context_length")), None)
             except Exception:
-                pass
+                return want  # Ollama down: don't remember "unknown" for this model
             self.model_ctx[self.model] = limit
         limit = self.model_ctx[self.model]
         return min(want, limit) if limit else want
@@ -268,6 +353,26 @@ class MyApp(ctk.CTk):
             self.sidebar.grid_remove()
         self.save_setting("sidebar_hidden", not hidden)
 
+    def zoom(self, step):
+        """Text size of the chat and input box: +1/-1, or 0 to reset."""
+        size = FONT_SIZE if step == 0 else min(FONT_MAX, max(FONT_MIN, self.font_size + step))
+        if size == FONT_SIZE:
+            self.show_note(f"Text size {size} (normal)")
+        else:
+            limit = " (largest)" if size == FONT_MAX else " (smallest)" if size == FONT_MIN else ""
+            self.show_note(f"Text size {size}{limit}  ·  Ctrl+0 resets to {FONT_SIZE}")
+        if size == self.font_size:
+            return
+        self.font_size = size
+        self.save_setting("font_size", size)
+        font = ("TkDefaultFont", size)
+        self.response.configure(font=font)
+        self.entry.configure(font=font)
+        for b in self.bubbles:
+            b.configure(font=font)
+        self.renderer.set_size(size)
+        self.rewrap_bubbles()
+
     def toggle_theme(self):
         self.theme_name = "light" if self.theme_name == "dark" else "dark"
         self.save_setting("theme", self.theme_name)
@@ -290,6 +395,7 @@ class MyApp(ctk.CTk):
             b.configure(fg_color=t["bubble"], text_color=t["bubble_text"], bg_color=t["surface"])
         self.container.configure(fg_color=t["surface"])
         self.list_title.configure(text_color=t["text"])
+        self.update_status()
         self.chat_list.configure(
             fg_color=t["surface"],
             scrollbar_button_color=t["scrollbar"],
@@ -297,7 +403,7 @@ class MyApp(ctk.CTk):
         )
         self.toolbar.configure(fg_color=t["surface"])
         # flat icon buttons on the bar: just the icon, highlighted on hover
-        for btn in (self.sidebar_btn, self.new_btn, self.theme_btn):
+        for btn in (self.sidebar_btn, self.new_btn, self.prompt_btn, self.theme_btn):
             btn.configure(fg_color="transparent", hover_color=t["list_hover"])
         self.stop_btn.configure(
             fg_color=t["button"], hover_color=t["button_hover"], text_color=t["text"]
@@ -319,17 +425,19 @@ class MyApp(ctk.CTk):
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")  # plain Tk images: we scale them ourselves
             for btn, name in ((self.sidebar_btn, "panel-left"), (self.new_btn, "square-pen"),
-                              (self.theme_btn, theme)):
+                              (self.prompt_btn, "scroll-text"), (self.theme_btn, theme)):
                 self._icons[name] = load_icon(name, t["text"], size)
                 btn.configure(image=self._icons[name])
         list_size = round(16 * self.theme_btn._get_widget_scaling())
-        self._icons["message-square"] = load_icon("message-square", t["muted"], list_size)
         self._icons["trash-2"] = load_icon("trash-2", t["muted"], list_size)
         self._icons["trash-armed"] = load_icon("trash-2", t["error"], list_size)
         self.refresh_list()
 
     def close(self):
         if self.generating:
+            # stop the reply first; poll() calls close() again once it's saved
+            self.closing = True
+            self.stop()
             return
         try:
             requests.post(
@@ -355,14 +463,39 @@ class MyApp(ctk.CTk):
             return
         self.entry.delete("1.0", "end")
         self.history.append({"role": "user", "content": text})
+        self.renderer.drop_actions("Regenerate", "Retry")  # only for the latest reply
+        self.add_user_bubble(text, len(self.history) - 1)
+        self.start_reply()
+
+    def start_reply(self):
+        """Ask the model to answer the history as it stands."""
         self.generating = True
         self.stop_event.clear()
         self.stop_btn.place(relx=1, rely=0.5, anchor="e", x=-22)
-        self.add_user_bubble(text)
         self.renderer.start()
         self.stats = None
         threading.Thread(target=self.worker, daemon=True).start()
         self.after(50, self.poll)
+
+    def regenerate(self):
+        """Drop the latest reply (if any; after an error there is none) and ask again."""
+        if self.generating or not self.history:
+            return
+        if self.history[-1]["role"] == "assistant":
+            self.history.pop()
+        self.render_history()
+        self.start_reply()
+
+    def reply_actions(self, i):
+        """Links under the reply at history[i]: Copy, and Regenerate on the latest one."""
+        actions = [("Copy", lambda: self.copy_reply(i), "Copied")]
+        if i == len(self.history) - 1:
+            actions.append(("Regenerate", self.regenerate, None))
+        return actions
+
+    def copy_reply(self, i):
+        self.clipboard_clear()
+        self.clipboard_append(strip_think(self.history[i]["content"]).strip())
 
     def stop(self):
         if not self.generating:
@@ -377,12 +510,61 @@ class MyApp(ctk.CTk):
                 pass
 
     def payload_messages(self):
-        """History as sent to the model: no saved thinking, stats or <think> blocks."""
-        return [
-            {"role": m["role"],
-             "content": re.sub(r"<think>.*?</think>\s*", "", m["content"], flags=re.S)}
+        """History as sent to the model: no saved thinking, stats or <think> blocks.
+        The system prompt goes first; it isn't saved with the chat, so editing it
+        also applies to old chats when you continue them."""
+        system = self.settings.get("system_prompt", "").strip()
+        return ([{"role": "system", "content": system}] if system else []) + [
+            {"role": m["role"], "content": strip_think(m["content"])}
             for m in self.history
         ]
+
+    def edit_system_prompt(self):
+        """Small window to edit the system prompt (one for all chats)."""
+        if self.prompt_win is not None and self.prompt_win.winfo_exists():
+            self.prompt_win.focus()
+            return
+        t = self.t
+        win = self.prompt_win = ctk.CTkToplevel(self, fg_color=t["window"])
+        win.title("System prompt")
+        win.geometry("520x320")
+        win.transient(self)
+        win.grid_columnconfigure(0, weight=1)
+        win.grid_rowconfigure(1, weight=1)
+
+        ctk.CTkLabel(
+            win,
+            text="Instructions sent to the model before every chat.",
+            anchor="w",
+            text_color=t["muted"],
+        ).grid(row=0, column=0, columnspan=3, sticky="ew", padx=10, pady=(10, 4))
+
+        box = ctk.CTkTextbox(
+            win,
+            wrap="word",
+            font=("TkDefaultFont", self.font_size),
+            fg_color=t["surface"],
+            text_color=t["text"],
+            scrollbar_button_color=t["scrollbar"],
+            scrollbar_button_hover_color=t["scrollbar_hover"],
+        )
+        box.grid(row=1, column=0, columnspan=3, sticky="nsew", padx=10)
+        box.insert("1.0", self.settings.get("system_prompt", ""))
+
+        def save():
+            self.save_setting("system_prompt", box.get("1.0", "end").strip())
+            win.destroy()
+
+        style = dict(width=80, fg_color=t["button"], hover_color=t["button_hover"],
+                     text_color=t["text"])
+        ctk.CTkButton(win, text="Cancel", command=win.destroy, **style).grid(
+            row=2, column=1, padx=(0, 6), pady=10)
+        ctk.CTkButton(win, text="Save", command=save, **style).grid(
+            row=2, column=2, padx=(0, 10), pady=10)
+        win.bind("<Escape>", lambda e: win.destroy())
+        win.bind("<Control-Return>", lambda e: save())
+        # CTkToplevel finishes setting itself up after a moment; focus once it's shown
+        win.after(150, lambda: (win.focus(), box.focus()))
 
     def worker(self):
         reply = thinking = ""
@@ -424,6 +606,10 @@ class MyApp(ctk.CTk):
                                 stats["ctx"] = prompt + n
                                 stats["ctx_max"] = ctx
                         break
+        except requests.ConnectionError:
+            if not self.stop_event.is_set():
+                self.q.put(("error", "[error: can't reach Ollama at localhost:11434. Is it running?]"))
+                self.q.put(("offline", None))
         except Exception as e:
             if not self.stop_event.is_set():
                 self.q.put(("error", f"[error: {e}]"))
@@ -450,17 +636,23 @@ class MyApp(ctk.CTk):
                     self.renderer.think(data)
                 elif kind == "error":
                     self.renderer.show_error(data)
+                elif kind == "offline":
+                    self.set_online(False)
                 elif kind == "done":
                     stats, stopped = data
-                    self.renderer.finish(stats=stats)
-                    if stopped:
-                        self.renderer.mark_stopped()
+                    if self.history and self.history[-1]["role"] == "assistant":
+                        actions = self.reply_actions(len(self.history) - 1)
+                    else:  # no reply: failed (e.g. Ollama down) or stopped before any text
+                        actions = [("Retry", self.regenerate, None)]
+                    self.renderer.finish(stats=stats, stopped=stopped, actions=actions)
                     secs = self.renderer.think_secs
                     if secs is not None and self.history and self.history[-1]["role"] == "assistant":
                         self.history[-1]["think_secs"] = secs
                     self.generating = False
                     self.stop_btn.place_forget()
                     self.save_chat()
+                    if self.closing:
+                        self.close()
                     return
         except queue.Empty:
             pass
@@ -487,7 +679,7 @@ class MyApp(ctk.CTk):
             b.configure(wraplength=wrap)
         self.renderer.resize()
 
-    def add_user_bubble(self, text):
+    def add_user_bubble(self, text, index):
         t = self.t
         tb = self.response._textbox
         bubble = ctk.CTkLabel(
@@ -499,14 +691,14 @@ class MyApp(ctk.CTk):
             fg_color=t["bubble"],
             bg_color=t["surface"],
             text_color=t["bubble_text"],
-            font=("TkDefaultFont", FONT_SIZES["user"]),
+            font=("TkDefaultFont", self.font_size),
             wraplength=self.bubble_wrap(),
             padx=6,
             pady=8,
         )
         # wheel over the bubble should still scroll the chat
         self.renderer.forward_wheel(bubble)
-        bubble.bind("<Button-3>", lambda e: self.bubble_menu(e, text))
+        bubble.bind("<Button-3>", lambda e: self.bubble_menu(e, text, index))
         self.bubbles.append(bubble)
 
         self.response.configure(state="normal")
@@ -517,17 +709,31 @@ class MyApp(ctk.CTk):
         self.response.see("end")
         self.response.configure(state="disabled")
 
-    def bubble_menu(self, event, text):
+    def bubble_menu(self, event, text, index):
         def copy():
             self.clipboard_clear()
             self.clipboard_append(text)
 
         menu = self.themed_menu()
         menu.add_command(label="Copy", command=copy)
+        menu.add_command(label="Edit", command=lambda: self.edit_message(index),
+                         state="disabled" if self.generating else "normal")
         try:
             menu.tk_popup(event.x_root, event.y_root)
         finally:
             menu.grab_release()
+
+    def edit_message(self, i):
+        """Cut the chat off at your message i and put its text back in the input box
+        to change and send again. The saved chat only changes once you send."""
+        if self.generating:
+            return
+        text = self.history[i]["content"]
+        self.history = self.history[:i]
+        self.render_history()
+        self.entry.delete("1.0", "end")
+        self.entry.insert("1.0", text)
+        self.entry.focus()
 
     def themed_menu(self):
         t = self.t
@@ -547,9 +753,16 @@ class MyApp(ctk.CTk):
             return
         if not self.chat_id:
             self.chat_id = datetime.now().strftime("%Y%m%d-%H%M%S")
-        title = self.history[0]["content"].splitlines()[0][:40]
-        data = {"title": title, "messages": self.history}
-        (CHAT_DIR / f"{self.chat_id}.json").write_text(json.dumps(data, indent=2))
+        path = CHAT_DIR / f"{self.chat_id}.json"
+        try:
+            old = json.loads(path.read_text())
+        except (OSError, ValueError):
+            old = {}
+        data = {"title": self.history[0]["content"].splitlines()[0][:40]}
+        if old.get("renamed"):  # a name you gave it sticks
+            data = {"title": old["title"], "renamed": True}
+        data["messages"] = self.history
+        path.write_text(json.dumps(data, indent=2))
         self.refresh_list()
 
     def refresh_list(self):
@@ -562,8 +775,6 @@ class MyApp(ctk.CTk):
                 btn = ctk.CTkButton(
                     self.chat_list,
                     text=title,
-                    image=self._icons["message-square"],
-                    compound="left",
                     anchor="w",
                     fg_color="transparent",
                     hover_color=self.t["list_hover"],
@@ -579,9 +790,44 @@ class MyApp(ctk.CTk):
                     hover_color=self.t["list_hover"],
                 )
             trash.configure(command=lambda f=f, b=trash: self.trash_click(f, b))
+            btn.bind("<Button-3>", lambda e, f=f, b=btn: self.chat_menu(e, f, b))
             btn.grid(row=i, column=0, sticky="ew", pady=1)
             trash.grid(row=i, column=1, pady=1)
         self.after_idle(self.update_scrollbar)
+
+    def chat_menu(self, event, path, btn):
+        menu = self.themed_menu()
+        menu.add_command(label="Rename", command=lambda: self.rename_chat(path, btn))
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def rename_chat(self, path, btn):
+        """Edit the chat's name in place: Enter saves, Esc or clicking away cancels."""
+        t = self.t
+        entry = ctk.CTkEntry(
+            self.chat_list,
+            fg_color=t["window"],
+            border_color=t["button"],
+            text_color=t["text"],
+        )
+        entry.insert(0, btn.cget("text"))
+        entry.grid(**{k: v for k, v in btn.grid_info().items() if k != "in"})
+        entry.select_range(0, "end")
+        entry.focus()
+
+        def save(e):
+            name = entry.get().strip()
+            if name:
+                data = json.loads(path.read_text())
+                data["title"], data["renamed"] = name, True
+                path.write_text(json.dumps(data, indent=2))
+            self.refresh_list()
+
+        entry.bind("<Return>", save)
+        entry.bind("<Escape>", lambda e: entry.destroy())
+        entry.bind("<FocusOut>", lambda e: entry.winfo_exists() and entry.destroy())
 
     def update_scrollbar(self):
         canvas = self.chat_list._parent_canvas
@@ -627,18 +873,20 @@ class MyApp(ctk.CTk):
             return
         self.history = json.loads(path.read_text())["messages"]
         self.chat_id = path.stem
+        self.render_history()
+
+    def render_history(self):
         self.clear_response()
-        for m in self.history:
+        for i, m in enumerate(self.history):
             if m["role"] == "user":
-                self.add_user_bubble(m["content"])
+                self.add_user_bubble(m["content"], i)
             else:
                 self.renderer.start(think_secs=m.get("think_secs"))
                 if m.get("thinking"):
                     self.renderer.think(m["thinking"])
                 self.renderer.feed(m["content"])
-                self.renderer.finish(stats=m.get("stats"))
-                if m.get("stopped"):
-                    self.renderer.mark_stopped()
+                self.renderer.finish(stats=m.get("stats"), stopped=m.get("stopped", False),
+                                     actions=self.reply_actions(i))
 
 
 if __name__ == "__main__":
