@@ -31,6 +31,15 @@ built with Python and [CustomTkinter](https://github.com/TomSchimansky/CustomTki
   screenshot or a copied image file with Ctrl+V. Click a picture in the chat to open it
 - A system prompt for all chats (the scroll button in the toolbar), e.g. "be concise,
   best option first"; it's sent with every request but not saved into chats
+- Read replies aloud with the Speak link under them, using [Piper](https://github.com/OHF-Voice/piper1-gpl)
+  on the CPU (optional, see below), or turn on the speaker button in the toolbar to have every
+  reply read out as it streams in. Code blocks are skipped; Stop (or Esc) stops the speech too
+- Talk instead of typing: click the mic (or Ctrl+M) and talk; when you stop, what you said is
+  sent. Uses Whisper on the CPU (optional, see below); Esc cancels. Once the reply has been
+  written (and read out, with the speaker button on) it listens again, so you can keep talking
+  back and forth; saying nothing for a while, Esc or Stop ends the conversation
+- A settings window (gear button, or Ctrl+,) for the context size and temperature, the voice
+  and speed for reading aloud (with a Test button), and the dictation options
 - Dark and light themes
 - Unloads the model from memory when you close the window
 
@@ -41,6 +50,8 @@ built with Python and [CustomTkinter](https://github.com/TomSchimansky/CustomTki
   with at least one model pulled
 - Python packages: `customtkinter`, `requests`, `pillow`
 - Optional: `pygments` for syntax highlighting in code blocks
+- Optional, for reading replies aloud: `piper-tts` and at least one Piper voice
+- Optional, for dictation: `faster-whisper`, and `pw-record` (PipeWire) or `arecord` to use the mic
 - Optional, for images: `wl-paste` (package `wl-clipboard`) to paste images on Wayland, and
   `kdialog` or `zenity` for the desktop's own file picker (otherwise Tk's basic one is used)
 
@@ -57,6 +68,8 @@ git clone https://github.com/KillGorack/LULIM.git
 cd LULIM
 pip install --user customtkinter requests pillow
 pip install --user pygments  # optional: syntax highlighting
+pip install --user piper-tts  # optional: Speak link
+pip install --user faster-whisper  # optional: dictation
 ```
 
 Pull a model if you don't have one yet. The default is `qwen2.5-coder:7b`:
@@ -93,6 +106,27 @@ These settings are constants at the top of `main.py`:
 | `NUM_CTX`  | `16384`                                 | Context window in tokens, capped at the model's max |
 
 Your last model and theme are remembered in `~/.local/share/quen/settings.json`.
+
+For the Speak link, put a Piper voice (its `.onnx` and `.onnx.json` files) in
+`~/.local/share/quen/voices/`, e.g.:
+
+```bash
+mkdir -p ~/.local/share/quen/voices && cd ~/.local/share/quen/voices
+python3 -m piper.download_voices en_US-lessac-medium
+```
+
+With several voices there, set `"voice": "en_US-lessac-medium"` in `settings.json` to pick one;
+otherwise the first one (alphabetically) is used. Voices can be heard at
+https://rhasspy.github.io/piper-samples/.
+
+Dictation uses Whisper's `small` model, downloaded (~465 MB) to `~/.cache/huggingface` the
+first time you use the mic. Set `"whisper_model"` in `settings.json` to `base` for faster but
+rougher results, or `large-v3-turbo` for the most accurate. Listening ends after 1.5 seconds of
+quiet (`"dictation_silence"`), or when you click the mic again. With `"dictation_send": false` the
+text is only typed into the chatbox, for you to check and send yourself, and `"conversation": false`
+stops it listening again after each reply. It records from the system's default
+input, so if nothing is heard, check that device isn't muted (and that a Bluetooth headset is in
+its headset profile, which is the one with a working mic).
 You can also set `"num_ctx"` there to override `NUM_CTX`. A bigger context window
 lets the model remember more of a long chat, but uses more memory (VRAM/RAM).
 

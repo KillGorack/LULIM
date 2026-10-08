@@ -8,6 +8,7 @@ import queue
 import re
 import shutil
 import subprocess
+import sys
 import threading
 import warnings
 import tkinter as tk
@@ -19,7 +20,9 @@ import customtkinter as ctk
 import requests
 from PIL import Image
 
+from listen import MODEL as WHISPER_MODEL, SILENCE, Listener
 from render import ReplyRenderer
+from speech import Speaker, split_ready
 
 MODEL = "qwen2.5-coder:7b"
 URL = "http://localhost:11434/api/chat"
@@ -32,6 +35,7 @@ NUM_CTX = 16384
 CHAT_DIR = Path.home() / ".local/share/quen/chats"
 SETTINGS_FILE = CHAT_DIR.parent / "settings.json"
 IMAGE_DIR = CHAT_DIR / "images"  # attached images, named by content hash
+VOICE_DIR = CHAT_DIR.parent / "voices"  # Piper voices for Speak; "voice" in settings.json picks one
 IMAGE_TYPES = (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp")
 IMAGE_MAX = 1600  # longest side kept when attaching; models scale down further anyway
 ICON_DIR = Path(__file__).with_name("icons")  # Lucide icons (ISC), see icons/LICENSE
@@ -197,6 +201,82 @@ def load_icon(name, color, size=18):
     return tk.PhotoImage(data=base64.b64encode(buf.getvalue()))
 
 
+def set_image(widget, image):
+    """Give a CTk widget a plain Tk image without CTk's warning about it: the icons
+    are scaled for the display by load_icon() instead."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        widget.configure(image=image)
+
+
+class Tooltip:
+    """A small label under a widget once the pointer has rested on it for a moment.
+    `text` can be a function, for buttons that change meaning (on/off toggles);
+    `theme` gives the current colors."""
+
+    DELAY = 500  # ms
+
+    def __init__(self, widget, text, theme):
+        self.widget, self.text, self.theme = widget, text, theme
+        self.tip = self.job = None
+        self.waited = 0
+        self.clicked = False  # no tooltip again until the pointer has left
+        # CTk widgets are a frame with a canvas and labels inside: watch them all
+        for w in (widget, *widget.winfo_children()):
+            tk.Misc.bind(w, "<Enter>", self.enter, add="+")
+            tk.Misc.bind(w, "<ButtonPress>", self.click, add="+")
+
+    def pointer_inside(self):
+        w = self.widget
+        if not w.winfo_exists() or not w.winfo_ismapped():
+            return False
+        x, y = w.winfo_pointerxy()
+        return (w.winfo_rootx() <= x < w.winfo_rootx() + w.winfo_width()
+                and w.winfo_rooty() <= y < w.winfo_rooty() + w.winfo_height())
+
+    def enter(self, event=None):
+        if self.job is None:
+            self.waited = 0
+            self.clicked = False
+            self.job = self.widget.after(100, self.watch)
+
+    def click(self, event=None):
+        self.clicked = True
+        self.hide()
+
+    def watch(self):
+        """Polls instead of relying on <Leave>: moving between the CTk widget's own
+        parts sends Leave events while the pointer is still on the button."""
+        self.job = None
+        if not self.pointer_inside():
+            self.hide()
+            return
+        self.waited += 100
+        if self.tip is None and not self.clicked and self.waited >= self.DELAY:
+            self.show()
+        self.job = self.widget.after(100, self.watch)
+
+    def show(self):
+        text = self.text() if callable(self.text) else self.text
+        if not text:
+            return
+        t, w = self.theme(), self.widget
+        self.tip = tk.Toplevel(w)
+        self.tip.overrideredirect(True)
+        tk.Label(self.tip, text=text, bg=t["surface"], fg=t["text"], padx=6, pady=2,
+                 highlightthickness=1, highlightbackground=t["rule"],
+                 font=("TkDefaultFont", 10)).pack()
+        self.tip.update_idletasks()
+        x = w.winfo_rootx() + (w.winfo_width() - self.tip.winfo_width()) // 2
+        x = max(0, min(x, w.winfo_screenwidth() - self.tip.winfo_width()))
+        self.tip.geometry(f"+{x}+{w.winfo_rooty() + w.winfo_height() + 4}")
+
+    def hide(self):
+        if self.tip is not None:
+            self.tip.destroy()
+            self.tip = None
+
+
 class MyApp(ctk.CTk):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -243,7 +323,7 @@ class MyApp(ctk.CTk):
         self.entry.bind("<Control-a>", lambda e: (
             self.entry._textbox.tag_add("sel", "1.0", "end-1c"), "break")[1])
         self.entry.bind("<Shift-Return>", self.on_shift_enter)
-        self.bind("<Escape>", lambda e: self.stop())
+        self.bind("<Escape>", lambda e: self.on_escape())
 
         # images waiting to be sent, above the entry; hidden while there are none
         self.pending = []
@@ -251,31 +331,47 @@ class MyApp(ctk.CTk):
         self.attach_bar.grid(row=2, column=1, sticky="ew", padx=10, pady=(0, 10))
         self.attach_bar.grid_remove()
 
-        # only shown while a reply is streaming, over the right edge of the entry
+        # only shown while a reply is streaming or being read aloud, over the right
+        # edge of the entry
         self.stop_btn = ctk.CTkButton(self.entry, text="Stop", width=60, command=self.stop)
 
-        # button bar between chat and entry: sidebar toggle and new chat on the left,
-        # model and theme on the right
+        # button bar between chat and entry, in groups split by thin dividers:
+        #   sidebar, new chat | attach, mic, speaker   (status)   model, system prompt | settings, theme
         self.toolbar = ctk.CTkFrame(self, corner_radius=self.response.cget("corner_radius"))
         self.toolbar.grid(row=1, column=1, sticky="ew", padx=10, pady=10)
-        self.toolbar.grid_columnconfigure(2, weight=1)
+        self.toolbar.grid_columnconfigure(6, weight=1)
+        self.dividers = []
+        for col in (2, 9):
+            d = tk.Frame(self.toolbar, width=1, height=18, bd=0)  # CTk won't draw 1px wide
+            d.grid(row=0, column=col, padx=6)
+            self.dividers.append(d)
 
         self.sidebar_btn = ctk.CTkButton(
             self.toolbar, text="", width=32, command=self.toggle_sidebar
         )
         self.sidebar_btn.grid(row=0, column=0, padx=(6, 2), pady=6)
         self.new_btn = ctk.CTkButton(self.toolbar, text="", width=32, command=self.new_chat)
-        self.new_btn.grid(row=0, column=1, pady=6)
+        self.new_btn.grid(row=0, column=1, padx=(0, 2), pady=6)
 
         # shown in the bar's empty middle while Ollama can't be reached
         self.status = ctk.CTkLabel(self.toolbar, text="", anchor="e")
-        self.status.grid(row=0, column=2, sticky="e", padx=8)
+        self.status.grid(row=0, column=6, sticky="e", padx=8)
         self.note = self.note_job = None  # brief message shown there, e.g. text size
 
         # attach images: only shown when the current model can see them
         self.attach_btn = ctk.CTkButton(self.toolbar, text="", width=32, command=self.attach_dialog)
-        self.attach_btn.grid(row=0, column=3, padx=(0, 4), pady=6)
+        self.attach_btn.grid(row=0, column=3, padx=(0, 2), pady=6)
         self.model_infos = {}  # model -> {"ctx": trained context length, "vision": bool}
+
+        # dictate into the entry: only shown when faster-whisper and a recorder are installed
+        self.listener = Listener()
+        self.dictation = None  # "listening", then "transcribing"
+        self.conversing = False  # listen again once the reply to what you said is done
+        self.mic_btn = ctk.CTkButton(self.toolbar, text="", width=32, command=self.toggle_dictation)
+        self.mic_btn.grid(row=0, column=4, padx=(0, 2), pady=6)
+        if not self.listener.available():
+            self.mic_btn.grid_remove()
+        self.bind("<Control-m>", lambda e: (self.toggle_dictation(), "break")[1])
 
         models = self.get_models()
         self.online = True
@@ -290,13 +386,31 @@ class MyApp(ctk.CTk):
         )
         self.model_menu.set(self.model)
         self.title(f"LULIM - {self.model}")
-        self.model_menu.grid(row=0, column=4, padx=(0, 4), pady=6)
+        self.model_menu.grid(row=0, column=7, padx=(0, 4), pady=6)
+
+        # read replies aloud as they come in: only shown when Piper and a voice are installed
+        self.speaker = Speaker(VOICE_DIR)
+        self.spoken = None  # history index of the reply being read aloud
+        self.speak_buf = None  # streamed reply text not yet spoken, while it's followed
+        self.speech_watched = False
+        self.speak_btn = ctk.CTkButton(
+            self.toolbar, text="", width=32, command=self.toggle_auto_speak
+        )
+        self.speak_btn.grid(row=0, column=5, padx=(0, 2), pady=6)
+        if not self.speaker.available():
+            self.speak_btn.grid_remove()
 
         self.prompt_btn = ctk.CTkButton(
             self.toolbar, text="", width=32, command=self.edit_system_prompt
         )
-        self.prompt_btn.grid(row=0, column=5, padx=(0, 2), pady=6)
+        self.prompt_btn.grid(row=0, column=8, pady=6)
         self.prompt_win = None
+
+        self.settings_btn = ctk.CTkButton(
+            self.toolbar, text="", width=32, command=self.open_settings
+        )
+        self.settings_btn.grid(row=0, column=10, padx=(0, 2), pady=6)
+        self.settings_win = None
 
         self.theme_btn = ctk.CTkButton(
             self.toolbar,
@@ -304,7 +418,7 @@ class MyApp(ctk.CTk):
             width=32,
             command=self.toggle_theme,
         )
-        self.theme_btn.grid(row=0, column=6, padx=(0, 6), pady=6)
+        self.theme_btn.grid(row=0, column=11, padx=(0, 6), pady=6)
 
         # sidebar: just the saved chats
         self.sidebar = ctk.CTkFrame(self, width=250, corner_radius=0, fg_color="transparent")
@@ -338,6 +452,7 @@ class MyApp(ctk.CTk):
         self.bind("<Control-b>", lambda e: self.toggle_sidebar())
         self.bind("<Control-f>", lambda e: self.focus_search())
         self.bind("<Control-n>", lambda e: self.new_chat())
+        self.bind("<Control-comma>", lambda e: self.open_settings())
         for key, step in (("plus", 1), ("equal", 1), ("KP_Add", 1), ("minus", -1),
                           ("KP_Subtract", -1), ("Key-0", 0)):
             self.bind(f"<Control-{key}>", lambda e, s=step: self.zoom(s))
@@ -358,6 +473,24 @@ class MyApp(ctk.CTk):
         if self.settings.get("sidebar_hidden"):
             self.sidebar.grid_remove()
         self.protocol("WM_DELETE_WINDOW", self.close)
+
+        theme = lambda: self.t
+        for widget, text in (
+            (self.sidebar_btn, lambda: "Show chats (Ctrl+B)" if self.sidebar.winfo_manager() == ""
+                               else "Hide chats (Ctrl+B)"),
+            (self.new_btn, "New chat (Ctrl+N)"),
+            (self.attach_btn, "Attach images (or paste one with Ctrl+V)"),
+            (self.mic_btn, lambda: "Stop listening (Esc cancels)" if self.dictation == "listening"
+                           else "Talk (Ctrl+M)"),
+            (self.speak_btn, lambda: "Read replies aloud: " + ("on" if self.settings.get("auto_speak")
+                                                                else "off")),
+            (self.model_menu, "Model to chat with"),
+            (self.prompt_btn, "System prompt"),
+            (self.settings_btn, "Settings (Ctrl+,)"),
+            (self.theme_btn, lambda: "Light theme" if self.theme_name == "dark" else "Dark theme"),
+            (self.stop_btn, "Stop (Esc)"),
+        ):
+            Tooltip(widget, text, theme)
 
     def get_models(self):
         """Installed model names, or None if Ollama can't be reached."""
@@ -441,6 +574,11 @@ class MyApp(ctk.CTk):
             self.attach_btn.grid()
         else:
             self.attach_btn.grid_remove()
+        # the attach / mic / speaker group can be empty: then so is its divider
+        if any(b.winfo_manager() for b in (self.attach_btn, self.mic_btn, self.speak_btn)):
+            self.dividers[0].grid()
+        else:
+            self.dividers[0].grid_remove()
 
     def num_ctx(self):
         """Context window for the current model: the setting, capped at the model's max."""
@@ -531,9 +669,11 @@ class MyApp(ctk.CTk):
             scrollbar_button_hover_color=t["scrollbar_hover"],
         )
         self.toolbar.configure(fg_color=t["surface"])
+        for d in self.dividers:
+            d.configure(bg=t["rule"])
         # flat icon buttons on the bar: just the icon, highlighted on hover
-        for btn in (self.sidebar_btn, self.new_btn, self.attach_btn, self.prompt_btn,
-                    self.theme_btn):
+        for btn in (self.sidebar_btn, self.new_btn, self.attach_btn, self.mic_btn,
+                    self.speak_btn, self.prompt_btn, self.settings_btn, self.theme_btn):
             btn.configure(fg_color="transparent", hover_color=t["list_hover"])
         self.stop_btn.configure(
             fg_color=t["button"], hover_color=t["button_hover"], text_color=t["text"]
@@ -557,14 +697,105 @@ class MyApp(ctk.CTk):
             warnings.simplefilter("ignore")  # plain Tk images: we scale them ourselves
             for btn, name in ((self.sidebar_btn, "panel-left"), (self.new_btn, "square-pen"),
                               (self.attach_btn, "paperclip"), (self.prompt_btn, "scroll-text"),
-                              (self.theme_btn, theme)):
+                              (self.settings_btn, "settings"), (self.theme_btn, theme)):
                 self._icons[name] = load_icon(name, t["text"], size)
                 btn.configure(image=self._icons[name])
+            for name in ("volume-2", "volume-x", "mic"):
+                self._icons[name] = load_icon(name, t["text"], size)
+            self._icons["mic-on"] = load_icon("mic", t["error"], size)  # recording
+        self.update_speak_btn()
+        self.update_mic_btn()
         self.refresh_attachments()
         list_size = round(16 * self.theme_btn._get_widget_scaling())
         self._icons["trash-2"] = load_icon("trash-2", t["muted"], list_size)
         self._icons["trash-armed"] = load_icon("trash-2", t["error"], list_size)
         self.refresh_list()
+
+    def update_speak_btn(self):
+        """Speaker icon while replies are read aloud as they come in, muted one otherwise."""
+        name = "volume-2" if self.settings.get("auto_speak") else "volume-x"
+        set_image(self.speak_btn, self._icons[name])
+
+    def toggle_auto_speak(self):
+        on = not self.settings.get("auto_speak", False)
+        self.save_setting("auto_speak", on)
+        self.update_speak_btn()
+        if not on:
+            self.stop_speaking()
+        self.show_note("Reading replies aloud" if on else "Not reading replies aloud")
+
+    def update_mic_btn(self):
+        """Mic icon, red while listening."""
+        name = "mic-on" if self.dictation == "listening" else "mic"
+        set_image(self.mic_btn, self._icons[name])
+
+    def toggle_dictation(self):
+        """Mic button / Ctrl+M: listen until you stop talking, then send what you said
+        (or just type it into the entry, with "dictation_send": false in settings.json).
+        Clicking again while listening ends it early."""
+        if self.dictation == "listening":
+            self.listener.finish()
+            return
+        if self.dictation or not self.listener.available():
+            return
+        self.stop_speaking()  # don't talk over yourself
+        self.listener.listen(self.settings.get("whisper_model", WHISPER_MODEL),
+                             self.settings.get("dictation_silence", SILENCE))
+        self.dictation = "listening"
+        self.update_mic_btn()
+        self.show_note("Listening (Esc to end the conversation)" if self.conversing
+                       else "Listening (Esc to cancel)", 600000)
+        self.after(100, self.poll_dictation)
+
+    def poll_dictation(self):
+        try:
+            while True:
+                kind, data = self.listener.events.get_nowait()
+                if kind == "transcribing":
+                    self.dictation = "transcribing"
+                    self.update_mic_btn()
+                    self.show_note("Transcribing…", 600000)
+                    continue
+                self.dictation = None
+                self.update_mic_btn()
+                conversing, self.conversing = self.conversing, self.conversing and bool(data)
+                if kind == "error":
+                    self.show_note(f"Can't dictate: {data}", 5000)
+                elif kind == "cancelled":
+                    self.show_note("Conversation ended" if conversing else "Dictation cancelled")
+                elif not data:
+                    self.show_note("Conversation ended" if conversing else "Didn't catch that", 3000)
+                else:
+                    self.show_note("", 1)
+                    self.dictated(data)
+                return
+        except queue.Empty:
+            self.after(100, self.poll_dictation)
+
+    def dictated(self, text):
+        """Put dictated text into the entry, after anything typed there, and send it."""
+        before = self.entry.get("insert -1c", "insert")
+        if before and not before.isspace():
+            text = " " + text
+        self.entry.insert("insert", text)
+        self.entry.focus_set()
+        if self.settings.get("dictation_send", True):
+            self.send()  # does nothing while a reply is still coming: then it waits there
+            self.conversing = self.generating and self.settings.get("conversation", True)
+
+    def listen_again(self):
+        """Conversation mode: once the reply to something you said has been written and
+        read out, listen for your answer. Saying nothing ends the conversation."""
+        if (self.conversing and not self.generating and not self.speaker.speaking
+                and not self.dictation and not self.closing):
+            self.toggle_dictation()
+
+    def on_escape(self):
+        """Esc cancels dictation; otherwise it's the Stop button."""
+        if self.dictation:
+            self.listener.cancel()
+        else:
+            self.stop()
 
     def close(self):
         if self.generating:
@@ -572,6 +803,8 @@ class MyApp(ctk.CTk):
             self.closing = True
             self.stop()
             return
+        self.stop_speaking()
+        self.listener.cancel()
         try:
             requests.post(
                 UNLOAD_URL,
@@ -594,6 +827,7 @@ class MyApp(ctk.CTk):
         text = self.entry.get("1.0", "end").strip()
         if self.generating or not (text or self.pending):
             return
+        self.conversing = False  # dictated() turns it back on for spoken messages
         if self.pending and not self.has_vision():
             self.show_note(f"{self.model} can't read images: remove them or switch models", 4000)
             return
@@ -611,9 +845,15 @@ class MyApp(ctk.CTk):
         """Ask the model to answer the history as it stands."""
         self.generating = True
         self.stop_event.clear()
-        self.stop_btn.place(relx=1, rely=0.5, anchor="e", x=-22)
+        self.show_stop_btn()
         self.renderer.start()
         self.stats = None
+        if self.settings.get("auto_speak") and self.speaker.available():
+            self.speaker.start(*self.voice_settings())
+            self.spoken = len(self.history)  # where the reply will go
+            self.speak_buf = ""
+            if not self.speech_watched:
+                self.watch_speech()
         threading.Thread(target=self.worker, daemon=True).start()
         self.after(50, self.poll)
 
@@ -627,8 +867,11 @@ class MyApp(ctk.CTk):
         self.start_reply()
 
     def reply_actions(self, i):
-        """Links under the reply at history[i]: Copy, and Regenerate on the latest one."""
+        """Links under the reply at history[i]: Copy, Speak if Piper and a voice are
+        installed, and Regenerate on the latest one."""
         actions = [("Copy", lambda: self.copy_reply(i), "Copied")]
+        if self.speaker.available():
+            actions.append(("Speak", lambda: self.speak_reply(i), None))
         if i == len(self.history) - 1:
             actions.append(("Regenerate", self.regenerate, None))
         return actions
@@ -637,8 +880,50 @@ class MyApp(ctk.CTk):
         self.clipboard_clear()
         self.clipboard_append(strip_think(self.history[i]["content"]).strip())
 
-    def stop(self):
+    def speak_reply(self, i):
+        """Read the reply aloud; clicking Speak again while it's being read stops it."""
+        if self.speaker.speaking and self.spoken == i:
+            self.stop_speaking()
+            return
+        self.speak_buf = None  # no longer following a streaming reply
+        self.conversing = False
+        self.speaker.speak(strip_think(self.history[i]["content"]), *self.voice_settings())
+        self.spoken = i
+        if not self.speech_watched:
+            self.watch_speech()
+
+    def watch_speech(self):
+        """Keeps the Stop button up while speech plays; says so if Piper failed."""
+        if self.speaker.speaking:
+            self.show_stop_btn()
+            self.speech_watched = True
+            self.after(300, self.watch_speech)
+            return
+        self.speech_watched = False
         if not self.generating:
+            self.stop_btn.place_forget()
+        if self.speaker.error:
+            self.show_note(f"Can't speak: {self.speaker.error}", 5000)
+        self.after(200, self.listen_again)  # a moment for the speakers to fall quiet
+
+    def voice_settings(self):
+        """(voice, speed) for the speaker."""
+        return self.settings.get("voice"), self.settings.get("speech_speed", 1.0)
+
+    def stop_speaking(self):
+        self.speaker.stop()
+        self.spoken = self.speak_buf = None
+
+    def show_stop_btn(self):
+        self.stop_btn.place(relx=1, rely=0.5, anchor="e", x=-22)
+
+    def stop(self):
+        """Stop button / Esc: stops the reply being written, any speech and a
+        conversation."""
+        self.conversing = False
+        self.stop_speaking()
+        if not self.generating:
+            self.stop_btn.place_forget()
             return
         self.stop_event.set()
         # closing the stream unblocks the worker and makes Ollama abort the generation
@@ -818,6 +1103,178 @@ class MyApp(ctk.CTk):
         # CTkToplevel finishes setting itself up after a moment; focus once it's shown
         win.after(150, lambda: (win.focus(), box.focus()))
 
+    def open_settings(self):
+        """Settings window: model, voice and dictation options. Sections for voice and
+        dictation only show when Piper / faster-whisper are installed."""
+        if self.settings_win is not None and self.settings_win.winfo_exists():
+            self.settings_win.focus()
+            return
+        t = self.t
+        win = self.settings_win = ctk.CTkToplevel(self, fg_color=t["window"])
+        win.title("Settings")
+        win.resizable(False, False)
+        win.transient(self)
+        menu_style = dict(
+            width=220, fg_color=t["list_hover"], button_color=t["list_hover"],
+            button_hover_color=t["scrollbar"], text_color=t["text"],
+            dropdown_fg_color=t["surface"], dropdown_hover_color=t["list_hover"],
+            dropdown_text_color=t["text"],
+        )
+        button_style = dict(width=80, fg_color=t["button"], hover_color=t["button_hover"],
+                            text_color=t["text"])
+        get = {}  # setting -> function giving the value to save
+        win.grid_columnconfigure(0, weight=1)
+        sec, row, sections = None, 0, 0
+        # same label column width in every section, so the controls line up
+        label_width = round(110 * self.theme_btn._get_widget_scaling())
+
+        def section(title):
+            """A panel like the chat area and toolbar; fields below go into it."""
+            nonlocal sec, row, sections
+            sec = ctk.CTkFrame(win, fg_color=t["surface"],
+                               corner_radius=self.response.cget("corner_radius"))
+            sec.grid(row=sections, column=0, sticky="ew", padx=10, pady=(10, 0))
+            sec.grid_columnconfigure(0, minsize=label_width)
+            sections += 1
+            ctk.CTkLabel(sec, text=title, anchor="w", text_color=t["text"],
+                         font=ctk.CTkFont(weight="bold")).grid(
+                row=0, column=0, columnspan=2, sticky="w", padx=14, pady=(8, 2))
+            row = 1
+
+        def field(label, widget, note=""):
+            """A row: label on the left, centered on its control; a note under the control."""
+            nonlocal row
+            ctk.CTkLabel(sec, text=label, anchor="w", text_color=t["text"]).grid(
+                row=row, column=0, sticky="w", padx=(14, 12), pady=4)
+            widget.grid(row=row, column=1, sticky="w", padx=(0, 14), pady=4)
+            row += 1
+            if note:
+                ctk.CTkLabel(sec, text=note, anchor="w", justify="left", text_color=t["muted"],
+                             font=ctk.CTkFont(size=11), height=16).grid(
+                    row=row, column=1, sticky="w", padx=(0, 14), pady=(0, 4))
+                row += 1
+            # room under the last row; moved down as rows are added
+            sec.grid_rowconfigure(row, minsize=8)
+
+        def menu(key, choices, current):
+            """Dropdown of (label, value) choices; saves the chosen value under key."""
+            labels = [c[0] for c in choices]
+            m = ctk.CTkOptionMenu(sec, values=labels, **menu_style)
+            m.set(next((lbl for lbl, v in choices if v == current), labels[0]))
+            get[key] = lambda: dict(choices)[m.get()]
+            return m
+
+        def slider(key, lo, hi, steps, current, fmt):
+            box = ctk.CTkFrame(sec, fg_color="transparent")
+            value = ctk.CTkLabel(box, width=44, anchor="w", text_color=t["text"])
+            s = ctk.CTkSlider(
+                box, from_=lo, to=hi, number_of_steps=steps, width=170,
+                fg_color=t["list_hover"], progress_color=t["button"],
+                button_color=t["text"], button_hover_color=t["ai_text"],
+                command=lambda v: value.configure(text=fmt(v)),
+            )
+            s.set(current)
+            value.configure(text=fmt(current))
+            s.grid(row=0, column=0)
+            value.grid(row=0, column=1, padx=(8, 0))
+            get[key] = lambda: round(s.get(), 2)
+            return box, s
+
+        def check(key, text, current):
+            c = ctk.CTkCheckBox(sec, text=text, text_color=t["text"], fg_color=t["button"],
+                                hover_color=t["button_hover"], border_color=t["muted"],
+                                checkmark_color=t["text"])
+            if current:
+                c.select()
+            get[key] = lambda: bool(c.get())
+            return c
+
+        section("Model")
+        ctx = self.settings.get("num_ctx", NUM_CTX)
+        sizes = sorted({4096, 8192, 16384, 32768, 65536, 131072, ctx})
+        limit = (self.model_info(self.model) or {}).get("ctx")
+        field("Context size", menu("num_ctx", [(f"{n:,} tokens", n) for n in sizes], ctx),
+              "How much of the chat the model can see. Bigger uses more memory."
+              + (f"\n{self.model} goes up to {limit:,}." if limit else ""))
+        temp = self.settings.get("temperature")
+        temps = [("Model's default", None), ("0.2 (focused)", 0.2), ("0.5", 0.5),
+                 ("0.8", 0.8), ("1.0 (creative)", 1.0), ("1.3", 1.3)]
+        if temp not in dict(temps).values():
+            temps.append((str(temp), temp))
+        field("Temperature", menu("temperature", temps, temp),
+              "Lower sticks to the likeliest answer, higher varies more.")
+
+        if self.speaker.available() or VOICE_DIR.is_dir():
+            section("Reading aloud")
+            voices = self.speaker.voices()
+            if voices:
+                current = self.settings.get("voice")
+                voice = menu("voice", [(v, v) for v in voices],
+                             current if current in voices else voices[0])
+            else:
+                voice = ctk.CTkLabel(sec, text="No voices installed", text_color=t["muted"])
+            field("Voice", voice)
+            speed_box, speed = slider("speech_speed", 0.5, 2.0, 15,
+                                      self.settings.get("speech_speed", 1.0), lambda v: f"{v:.1f}×")
+            field("Speed", speed_box)
+            buttons = ctk.CTkFrame(sec, fg_color="transparent")
+            if voices:
+                ctk.CTkButton(buttons, text="Test", command=lambda: self.speaker.speak(
+                    "Hello! This is how I sound at this speed.", voice.get(),
+                    round(speed.get(), 2)), **button_style).grid(row=0, column=0, padx=(0, 6))
+            ctk.CTkButton(buttons, text="Voices folder", command=self.open_voice_dir,
+                          **{**button_style, "width": 110}).grid(row=0, column=1)
+            field("", buttons, "Add Piper voices (.onnx + .onnx.json) to this folder.")
+
+        if self.listener.available():
+            section("Talking to it")
+            field("Speech model", menu("whisper_model", [
+                ("tiny (fastest)", "tiny"), ("base", "base"), ("small", "small"),
+                ("medium", "medium"), ("large-v3-turbo (best)", "large-v3-turbo")],
+                self.settings.get("whisper_model", WHISPER_MODEL)),
+                "A new model downloads the first time it's used.")
+            silence_box, _ = slider("dictation_silence", 0.5, 4.0, 14,
+                                    self.settings.get("dictation_silence", SILENCE),
+                                    lambda v: f"{v:.1f} s")
+            field("Stop listening", silence_box, "of silence once you've started talking.")
+            field("", check("dictation_send", "Send what I say right away",
+                            self.settings.get("dictation_send", True)))
+            field("", check("conversation", "Listen again after each reply",
+                            self.settings.get("conversation", True)))
+
+        def save():
+            for key, value in get.items():
+                self.save_setting(key, value())
+            win.destroy()
+
+        def cancel():
+            self.speaker.stop()  # a voice test still going
+            win.destroy()
+
+        buttons = ctk.CTkFrame(win, fg_color="transparent")
+        buttons.grid(row=sections, column=0, sticky="e", padx=10, pady=10)
+        ctk.CTkButton(buttons, text="Cancel", command=cancel, **button_style).grid(
+            row=0, column=0, padx=(0, 6))
+        ctk.CTkButton(buttons, text="Save", command=save, **button_style).grid(row=0, column=1)
+        win.bind("<Escape>", lambda e: cancel())
+        win.protocol("WM_DELETE_WINDOW", cancel)
+        win.after(150, win.focus)  # CTkToplevel finishes setting itself up after a moment
+
+    def open_voice_dir(self):
+        VOICE_DIR.mkdir(parents=True, exist_ok=True)
+        if sys.platform == "win32":
+            os.startfile(VOICE_DIR)
+        else:
+            subprocess.Popen(["xdg-open", str(VOICE_DIR)])
+
+    def model_options(self, ctx):
+        """Ollama options: the context window, and the temperature if one is set
+        (otherwise the model's own default applies)."""
+        options = {"num_ctx": ctx}
+        if self.settings.get("temperature") is not None:
+            options["temperature"] = self.settings["temperature"]
+        return options
+
     def worker(self):
         reply = thinking = ""
         stats = None
@@ -829,7 +1286,7 @@ class MyApp(ctk.CTk):
                     "model": self.model,
                     "messages": self.payload_messages(),
                     "stream": True,
-                    "options": {"num_ctx": ctx},
+                    "options": self.model_options(ctx),
                 },
                 stream=True,
                 timeout=300,
@@ -884,6 +1341,10 @@ class MyApp(ctk.CTk):
                 kind, data = self.q.get_nowait()
                 if kind == "token":
                     self.renderer.feed(data)
+                    if self.speak_buf is not None:
+                        ready, self.speak_buf = split_ready(self.speak_buf + data)
+                        if ready.strip():
+                            self.speaker.feed(ready)
                 elif kind == "think":
                     self.renderer.think(data)
                 elif kind == "error":
@@ -896,15 +1357,23 @@ class MyApp(ctk.CTk):
                         actions = self.reply_actions(len(self.history) - 1)
                     else:  # no reply: failed (e.g. Ollama down) or stopped before any text
                         actions = [("Retry", self.regenerate, None)]
+                        self.conversing = False
                     self.renderer.finish(stats=stats, stopped=stopped, actions=actions)
                     secs = self.renderer.think_secs
                     if secs is not None and self.history and self.history[-1]["role"] == "assistant":
                         self.history[-1]["think_secs"] = secs
+                    if self.speak_buf is not None:  # the rest of the reply, then done
+                        self.speaker.feed(self.speak_buf)
+                        self.speaker.finish()
+                        self.speak_buf = None
                     self.generating = False
-                    self.stop_btn.place_forget()
+                    if not self.speaker.speaking:
+                        self.stop_btn.place_forget()
                     self.save_chat()
                     if self.closing:
                         self.close()
+                    elif not self.speech_watched:  # else once it's been read out
+                        self.listen_again()
                     return
         except queue.Empty:
             pass
@@ -1094,6 +1563,7 @@ class MyApp(ctk.CTk):
             btn.bind("<Button-3>", lambda e, f=f, b=btn: self.chat_menu(e, f, b))
             btn.grid(row=i, column=0, sticky="ew", pady=1)
             trash.grid(row=i, column=1, pady=1)
+            Tooltip(trash, "Delete (click twice)", lambda: self.t)
         self.after_idle(self.list_resized)
 
     def chat_menu(self, event, path, btn):
@@ -1204,13 +1674,13 @@ class MyApp(ctk.CTk):
             return
         self.disarm()
         self.armed, self.armed_btn = path, btn
-        btn.configure(image=self._icons["trash-armed"])
+        set_image(btn, self._icons["trash-armed"])
         self.after(3000, lambda: self.armed == path and self.disarm())
 
     def disarm(self):
         btn, self.armed, self.armed_btn = self.armed_btn, None, None
         if btn is not None and btn.winfo_exists():
-            btn.configure(image=self._icons["trash-2"])
+            set_image(btn, self._icons["trash-2"])
 
     def delete_chat(self, path):
         if self.generating:
@@ -1224,6 +1694,8 @@ class MyApp(ctk.CTk):
     def new_chat(self):
         if self.generating:
             return
+        self.stop_speaking()
+        self.conversing = False
         self.history = []
         self.chat_id = None
         self.clear_response()
@@ -1231,6 +1703,8 @@ class MyApp(ctk.CTk):
     def load_chat(self, path):
         if self.generating:
             return
+        self.stop_speaking()
+        self.conversing = False
         self.history = json.loads(path.read_text())["messages"]
         self.chat_id = path.stem
         self.render_history()
